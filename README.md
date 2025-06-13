@@ -1,4 +1,4 @@
-## The machinations of my mind
+*A personal clone of the BioDCASE 2025 Task 3 baseline system*
 
 <div align="center">
   <picture>
