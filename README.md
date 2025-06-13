@@ -1,3 +1,5 @@
+## The machinations of my mind
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="BioDCASE_header_light.svg">
