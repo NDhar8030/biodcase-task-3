@@ -1,11 +1,13 @@
 from keras import Model, layers
 from keras.src.applications.mobilenet import _conv_block, _depthwise_conv_block
-from keras.src.callbacks import History, EarlyStopping, TensorBoard
-from keras.src.metrics import AUC
+from keras.src.callbacks import History, EarlyStopping, TensorBoard, ModelCheckpoint
+from keras.src.metrics import AUC, Precision, Recall, F1Score
 import tensorflow as tf
 
 from paths import TENSORBOARD_LOGS_PATH
 from config import Config
+
+TRAIN_CHECKPOINT_PATH = "data//04_models"
 
 
 def create_model(input_shape, n_filters_1=32, n_filters_2=64, dropout=0.02) -> Model:
@@ -21,10 +23,12 @@ def create_model(input_shape, n_filters_1=32, n_filters_2=64, dropout=0.02) -> M
     model.compile(
         optimizer='adam',
         loss='binary_crossentropy',
-        metrics=[AUC(curve='PR', name='average_precision')]
+        metrics=[AUC(curve='PR', name='average_precision'),
+                 Precision(name='precision', class_id=1),
+                 Recall(name='recall', class_id=1),
+                 F1Score(name='f1_score', average='micro')]
     )
     return model
-
 
 def train_model(model: Model, train_ds, valid_ds, config: Config, class_weight) -> Model:
     tr_cfg = config.model_training
@@ -36,6 +40,13 @@ def train_model(model: Model, train_ds, valid_ds, config: Config, class_weight) 
         epochs=tr_cfg.n_epochs,
         class_weight=class_weight,
         callbacks=[
+            ModelCheckpoint(
+                filepath=f"{TRAIN_CHECKPOINT_PATH}//best_model.keras",
+                monitor="val_average_precision",
+                save_best_only=True,
+                save_weights_only=False,
+                mode="max",
+            ),
             EarlyStopping(
                 patience=tr_cfg.early_stopping.patience,
             ),
