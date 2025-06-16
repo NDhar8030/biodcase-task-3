@@ -101,12 +101,28 @@ def run_feature_extraction(config: Config):
         window_stride=fe_config.window_stride,
     )
 
-    features_example = do_windows_fn(data["data"].head(1)[0])
+    # Helper to convert stored bytes to numpy array
+    def bytes_to_array(b):
+        """Convert raw bytes (or other accepted formats) back to int16 numpy array."""
+        if isinstance(b, (bytes, bytearray)):
+            return np.frombuffer(b, dtype=np.int16)
+        if isinstance(b, np.ndarray):
+            return b.astype(np.int16)
+        # Fallback for legacy string representation of bytes
+        if isinstance(b, str):
+            try:
+                return np.frombuffer(eval(b), dtype=np.int16)
+            except Exception:
+                # Last-ditch effort: encode as latin-1 and interpret
+                return np.frombuffer(b.encode("latin1"), dtype=np.int16)
+        raise TypeError(f"Unsupported type for audio data: {type(b)}")
+
+    features_example = do_windows_fn(bytes_to_array(data["data"].head(1)[0]))
     features_shape = features_example.shape
     with TqdmCallback(desc="Extracting features from preprocessed data"):
         data = data.map_partitions(
             lambda df: df.assign(features=df["data"].apply(
-                lambda clip: do_windows_fn(clip).flatten(),
+                lambda clip: do_windows_fn(bytes_to_array(clip)).flatten(),
             )),
             meta=pd.DataFrame(
                 dict(
@@ -116,6 +132,9 @@ def run_feature_extraction(config: Config):
             )
         )
         sample = data.head(10)
+        # Ensure sample audio data is converted from bytes to numpy arrays for plotting
+        if not sample.empty:
+            sample["data"] = sample["data"].apply(bytes_to_array)
         features_sample_fig = plot_features_sample(sample, features_shape)
         data: dd.DataFrame = data.drop("data", axis=1)  # remove original audio
         data.to_parquet(

@@ -10,6 +10,8 @@ import dask
 from tqdm.dask import TqdmCallback
 import pyarrow as pa
 
+import audiomentations
+
 from config import load_config, Config
 from paths import CLIPS_DIR, PREPROC_PRQ_PATH
 
@@ -17,6 +19,16 @@ _PREPROC_DASK_BATCH_SIZE = 1000
 
 SPLIT_FOLDER_TO_SPLIT = {"Training_Set": "train", "Validation_Set": "validation", "Test_Set": "test"}
 
+BACKGROUND_NOISE_DIR = "data/01_raw/clips/Training_Set/Negatives/"
+augmenter = audiomentations.Compose([
+    audiomentations.AddGaussianSNR(min_snr_db=4.0, max_snr_db=16.0, p=0.3),
+    audiomentations.AddBackgroundNoise(
+        sounds_path=BACKGROUND_NOISE_DIR,
+        min_snr_db=4,
+        max_snr_db=16,
+        p=0.3
+    )
+])
 
 def extract_loudest_slice(audio_array, sample_rate, audio_slice_duration_ms):
     """Find the max of the audio, then return a slice of duration audio_slice_duration_ms centred on the max.
@@ -47,17 +59,31 @@ def extract_loudest_slice(audio_array, sample_rate, audio_slice_duration_ms):
 def run_preprocessing(config: Config):
     def do_batch(batch: Iterable[Path]):
         slice_data = []
-        for path in batch:
-            audio_array, sample_rate = librosa.load(path, sr=config.data_preprocessing.sample_rate, mono=True)
-            audio_array_int16 = (audio_array * np.iinfo(np.int16).max).astype(np.int16)
-            slice = extract_loudest_slice(audio_array_int16, sample_rate, config.data_preprocessing.audio_slice_duration_ms)
-            slice_data.extend([{
-                "data": slice,
+        for i, path in enumerate(batch):
+            # Load audio with consistent dtype
+            audio_array, sample_rate = librosa.load(path, sr=config.data_preprocessing.sample_rate, mono=True, dtype=np.float32)
+            
+            # Extract loudest slice while keeping as float32
+            slice = extract_loudest_slice(audio_array, sample_rate, config.data_preprocessing.audio_slice_duration_ms)
+            
+            # Apply augmentation (this returns float32)
+            slice = augmenter(samples=slice, sample_rate=sample_rate)
+            
+            # Convert to int16 after all processing is done
+            slice = (slice * np.iinfo(np.int16).max).astype(np.int16)
+            
+            slice_data.append({
+                "data": slice.tobytes(),  # Store raw bytes directly
                 "path": str(path),
-                "label": path.parent.name == "Yellowhammer",
+                "label": np.int32(path.parent.name == "Yellowhammer"),  # Explicitly use int32
                 "split": SPLIT_FOLDER_TO_SPLIT[path.parents[1].name],
-                "sample_rate": sample_rate
-            }])
+                "sample_rate": np.int32(sample_rate)  # Explicitly use int32
+            })
+            
+            if i < 1:
+                print("Successfully augmented slice")
+                print(f"Data type: {slice.dtype}, Shape: {slice.shape}")
+        
         return pd.DataFrame(slice_data)
 
     clips = list(CLIPS_DIR.rglob("*.wav"))
@@ -68,6 +94,15 @@ def run_preprocessing(config: Config):
         start_idx = batch_idx * _PREPROC_DASK_BATCH_SIZE
         end_idx = min(start_idx + _PREPROC_DASK_BATCH_SIZE, len(clips))
         batches.append(clips[start_idx:end_idx])
+
+    # Define schema explicitly using PyArrow
+    schema = pa.schema([
+        ('data', pa.binary()),
+        ('path', pa.string()),
+        ('split', pa.string()),
+        ('label', pa.int32()),
+        ('sample_rate', pa.int32())
+    ])
 
     with TqdmCallback(desc="Preprocessing clips in batches"):
         dask.config.set({"dataframe.convert-string": False})
@@ -83,7 +118,9 @@ def run_preprocessing(config: Config):
         all_data.to_parquet(
             PREPROC_PRQ_PATH,
             write_index=False,
-            schema={'data': pa.list_(pa.int16())}  # make sure array is serialized correctly
+            engine='pyarrow',
+            compression='snappy',
+            schema=schema  # Use the explicit schema
         )
 
 

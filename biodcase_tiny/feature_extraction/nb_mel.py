@@ -51,6 +51,11 @@ class FilterBankConstants:
 
 def _calc_center_freq(channel_num, lower_freq_limit, upper_freq_limit):
     """Calculate the center frequencies of filter_bank spectrum filter banks."""
+    print(f"Debug - _calc_center_freq inputs:")
+    print(f"channel_num: {channel_num}")
+    print(f"lower_freq_limit: {lower_freq_limit} ({type(lower_freq_limit)})")
+    print(f"upper_freq_limit: {upper_freq_limit} ({type(upper_freq_limit)})")
+    
     if lower_freq_limit < 0:
         raise ValueError("Lower frequency limit must be non negative")
     if lower_freq_limit > upper_freq_limit:
