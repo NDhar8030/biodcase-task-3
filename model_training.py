@@ -21,14 +21,18 @@ def set_seeds(seed):
 def make_tf_datasets(
     data: pd.DataFrame,
     features_shape,
-    buffer_size=10000,
-    seed=42,
-    batch_size=32,
+    config: Config,
+    buffer_size: int = 10000,
+    seed: int = 42,
+    batch_size: int = 32,
 ) -> tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset]:
     splits = {}
     for split, group_data in data.groupby("split"):
-        # shape (tf backend): batches, rows, cols, channels
-        features = np.array(group_data["features"].to_list()).reshape((-1, *features_shape, 1))
+        # shape (tf backend): batches, rows, cols, channels optional
+        if config.feature_extraction.add_channel_dim:
+            features = np.array(group_data["features"].to_list()).reshape((-1, *features_shape, 1))
+        else:
+            features = np.array(group_data["features"].to_list()).reshape((-1, *features_shape))
         one_hot_labels = to_categorical(group_data["label"], num_classes=2)
         dataset = tf.data.Dataset.from_tensor_slices((features, one_hot_labels))
         dataset = dataset.shuffle(buffer_size=buffer_size, seed=seed).batch(batch_size)
@@ -72,11 +76,17 @@ def run_model_training(config: Config):
     train_ds, valid_ds, reference_ds = make_tf_datasets(
         data,
         features_shape,
-        config.model_training.shuffle_buff_n, 
+        config,
+        config.model_training.shuffle_buff_n,
         config.model_training.seed,
-        config.model_training.batch_size
+        config.model_training.batch_size,
     )
-    model = create_model((*features_shape, 1))
+    if config.feature_extraction.add_channel_dim:
+        model_input_shape = (*features_shape, 1)
+    else:
+        model_input_shape = (*features_shape,)
+
+    model = create_model(model_input_shape)
     model = train_model(model, train_ds, valid_ds, config, class_weight)
     y_true, y_pred = predict_validation(model, valid_ds)
     cm_fig = get_confusion_matrix(y_true, y_pred, labels=["Other", "Yellowhammer"])

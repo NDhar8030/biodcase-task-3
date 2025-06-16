@@ -10,19 +10,40 @@ class DataPreprocessing(BaseModel):
 
 
 class FeatureExtraction(BaseModel):
-    window_len: int
-    window_stride: int
-    window_scaling_bits: int
-    mel_n_channels: int# = Field(ge=20, le=40, multiple_of=20)
-    mel_low_hz: int
-    mel_high_hz: int
-    mel_post_scaling_bits: int
+    """Parameters for feature extraction.
 
+    The original fixed-point DSP pipeline (window_len, mel_n_channels, …) is kept
+    for backward compatibility, but new TensorFlow parameters are added for the
+    TF-based preprocessing path.  Any YAML config file may contain either the
+    old keys, the new keys, or both.
+    """
+
+    # Legacy (fixed-point C pipeline) params – optional now
+    window_len: int | None = None
+    window_stride: int | None = None
+    window_scaling_bits: int | None = None
+    mel_n_channels: int | None = None
+    mel_low_hz: int | None = None
+    mel_high_hz: int | None = None
+    mel_post_scaling_bits: int | None = None
+
+    # New TF preprocessing params (defaults follow user request)
+    sample_rate: int = 16000
+    frame_length: int = 256
+    frame_step: int = 192  # 75 % overlap
+    mel_bins: int = 64
+    fmin: int = 1028
+    fmax: int = 8000
+    pad_to_samples: int = 32000
+    add_channel_dim: bool = True
+
+    # Keep original validator but guard against missing legacy keys
     @field_validator('mel_high_hz')
     @classmethod
     def validate_mel_high_hz(cls, v, values):
-        if v <= values.data['mel_low_hz']:
-            raise ValueError(f'mel_high_hz must be strictly greater than mel_low_hz')
+        if v is not None and values.data.get('mel_low_hz') is not None:
+            if v <= values.data['mel_low_hz']:
+                raise ValueError('mel_high_hz must be strictly greater than mel_low_hz')
         return v
 
 

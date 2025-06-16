@@ -1,15 +1,10 @@
-from functools import partial
 from pathlib import Path
-from typing import Iterable
+from typing import List
 
-import librosa
+import tensorflow as tf
 import numpy as np
 import pandas as pd
-import dask.dataframe as dd
-import dask
-from tqdm.dask import TqdmCallback
 import pyarrow as pa
-
 import audiomentations
 
 from config import load_config, Config
@@ -19,109 +14,116 @@ _PREPROC_DASK_BATCH_SIZE = 1000
 
 SPLIT_FOLDER_TO_SPLIT = {"Training_Set": "train", "Validation_Set": "validation", "Test_Set": "test"}
 
-BACKGROUND_NOISE_DIR = "data/01_raw/clips/Training_Set/Negatives/"
-augmenter = audiomentations.Compose([
-    audiomentations.AddGaussianSNR(min_snr_db=4.0, max_snr_db=16.0, p=0.3),
-    audiomentations.AddBackgroundNoise(
-        sounds_path=BACKGROUND_NOISE_DIR,
-        min_snr_db=4,
-        max_snr_db=16,
-        p=0.3
-    )
-])
+# Augmentation pipeline (executed on float32 signal in [-1,1])
+BACKGROUND_NOISE_DIR = Path("data/01_raw/clips/Training_Set/Negatives")
+# Fallback to no augment if directory missing
+if BACKGROUND_NOISE_DIR.exists():
+    augmenter = audiomentations.Compose([
+        audiomentations.AddGaussianSNR(min_snr_db=4.0, max_snr_db=16.0, p=0.3),
+        audiomentations.AddBackgroundNoise(
+            sounds_path=str(BACKGROUND_NOISE_DIR),
+            min_snr_db=4.0,
+            max_snr_db=16.0,
+            p=0.3,
+        ),
+    ])
+else:
+    augmenter = None
 
-def extract_loudest_slice(audio_array, sample_rate, audio_slice_duration_ms):
-    """Find the max of the audio, then return a slice of duration audio_slice_duration_ms centred on the max.
-    Also deal with boundary conditions.
+# ------------------------------
+# Helper functions
+# ------------------------------
 
-    :param audio_slice_duration_ms:
-    :return: slice with duration audio_slice_duration_ms
-    """
-    slice_n_samples = int(audio_slice_duration_ms / 1000 * sample_rate)
-    audio_n_samples = audio_array.shape[0]
-    left_edge = slice_n_samples // 2
-    right_edge = slice_n_samples - left_edge
+def load_wav_tf(path: Path, desired_sr: int) -> tuple[np.ndarray, int]:
+    """Load a WAV file with TensorFlow and return a mono int16 numpy array."""
+    file_contents = tf.io.read_file(str(path))
+    audio, sr = tf.audio.decode_wav(file_contents, desired_channels=1)
+    audio = tf.squeeze(audio, axis=-1)  # shape [N]
 
-    max_index = np.argmax(audio_array)
-    start_index = max(max_index - left_edge, 0)
-    end_index = min(max_index + right_edge, audio_n_samples)
+    # Resampling (if needed) – TensorFlow lacks built-in resample.  Assume all
+    # clips are already at the desired sample rate.  Otherwise, raise.
+    sr_val = int(sr.numpy())
+    if sr_val != desired_sr:
+        raise ValueError(f"Expected sample rate {desired_sr}, got {sr_val} in {path}")
 
-    # Handle edge cases where the slice would go beyond bounds
-    if end_index - start_index < slice_n_samples:
-        if start_index == 0:  # Cut at left edge
-            end_index = slice_n_samples
-        else:  # Cut at right edge
-            start_index = audio_n_samples - slice_n_samples
-            end_index = audio_n_samples
-    return audio_array[start_index:end_index]
+    # Convert float32 in [-1, 1] ➜ int16
+    audio_int16 = tf.cast(tf.clip_by_value(audio, -1.0, 1.0) * 32767.0, tf.int16)
+    return audio_int16.numpy(), sr_val
+
+
+def extract_loudest_slice(array: np.ndarray, sample_rate: int, slice_dur_ms: int) -> np.ndarray:
+    """Return a fixed-length slice centred on the max absolute amplitude."""
+    slice_samples = int(slice_dur_ms / 1000 * sample_rate)
+    if array.shape[0] <= slice_samples:
+        return array  # Already short enough
+
+    max_idx = int(np.argmax(np.abs(array)))
+    left = slice_samples // 2
+    start = max(max_idx - left, 0)
+    end = start + slice_samples
+    if end > array.shape[0]:
+        end = array.shape[0]
+        start = end - slice_samples
+    return array[start:end]
 
 
 def run_preprocessing(config: Config):
-    def do_batch(batch: Iterable[Path]):
-        slice_data = []
-        for i, path in enumerate(batch):
-            # Load audio with consistent dtype
-            audio_array, sample_rate = librosa.load(path, sr=config.data_preprocessing.sample_rate, mono=True, dtype=np.float32)
-            
-            # Extract loudest slice while keeping as float32
-            slice = extract_loudest_slice(audio_array, sample_rate, config.data_preprocessing.audio_slice_duration_ms)
-            
-            # Apply augmentation (this returns float32)
-            slice = augmenter(samples=slice, sample_rate=sample_rate)
-            
-            # Convert to int16 after all processing is done
-            slice = (slice * np.iinfo(np.int16).max).astype(np.int16)
-            
-            slice_data.append({
-                "data": slice.tobytes(),  # Store raw bytes directly
-                "path": str(path),
-                "label": np.int32(path.parent.name == "Yellowhammer"),  # Explicitly use int32
-                "split": SPLIT_FOLDER_TO_SPLIT[path.parents[1].name],
-                "sample_rate": np.int32(sample_rate)  # Explicitly use int32
-            })
-            
-            if i < 1:
-                print("Successfully augmented slice")
-                print(f"Data type: {slice.dtype}, Shape: {slice.shape}")
-        
-        return pd.DataFrame(slice_data)
+    desired_sr = config.feature_extraction.sample_rate
 
+    records: List[dict] = []
     clips = list(CLIPS_DIR.rglob("*.wav"))
+    for idx, wav_path in enumerate(clips):
+        audio_int16, sr_val = load_wav_tf(wav_path, desired_sr)
 
-    batches = []
-    total_batches = (len(clips) + _PREPROC_DASK_BATCH_SIZE - 1) // _PREPROC_DASK_BATCH_SIZE
-    for batch_idx in range(total_batches):
-        start_idx = batch_idx * _PREPROC_DASK_BATCH_SIZE
-        end_idx = min(start_idx + _PREPROC_DASK_BATCH_SIZE, len(clips))
-        batches.append(clips[start_idx:end_idx])
+        # Convert to float32 [-1,1]
+        wav_f32 = audio_int16.astype(np.float32) / 32767.0
 
-    # Define schema explicitly using PyArrow
+        # (Optional) loudest slice cropping for bird call localisation
+        wav_f32 = extract_loudest_slice(
+            wav_f32,
+            sr_val,
+            config.data_preprocessing.audio_slice_duration_ms,
+        )
+
+        # Apply waveform augmentation if pipeline exists
+        if augmenter is not None:
+            wav_f32 = augmenter(samples=wav_f32, sample_rate=sr_val)
+
+        # Convert back to int16 for storage
+        audio_slice = (np.clip(wav_f32, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+        records.append({
+            "data": audio_slice.tobytes(),
+            "path": str(wav_path),
+            "label": np.int32(wav_path.parent.name == "Yellowhammer"),
+            "split": SPLIT_FOLDER_TO_SPLIT[wav_path.parents[1].name],
+            "sample_rate": np.int32(sr_val),
+        })
+
+        if idx < 3:
+            print(f"Loaded {wav_path.name}: shape {audio_slice.shape}, dtype {audio_slice.dtype}")
+
+    df = pd.DataFrame(records)
+
+    # Parquet schema
     schema = pa.schema([
-        ('data', pa.binary()),
-        ('path', pa.string()),
-        ('split', pa.string()),
-        ('label', pa.int32()),
-        ('sample_rate', pa.int32())
+        ("data", pa.binary()),
+        ("path", pa.string()),
+        ("split", pa.string()),
+        ("label", pa.int32()),
+        ("sample_rate", pa.int32()),
     ])
 
-    with TqdmCallback(desc="Preprocessing clips in batches"):
-        dask.config.set({"dataframe.convert-string": False})
-        all_data: dd.DataFrame = dd.from_map(
-            do_batch, batches, meta=pd.DataFrame({
-                "data": pd.Series([], dtype=object),
-                "path": pd.Series(dtype="string"),
-                "split": pd.Series(dtype="string"),
-                "label": pd.Series(dtype="int32"),
-                "sample_rate": pd.Series(dtype="int32")
-            })
-        )
-        all_data.to_parquet(
-            PREPROC_PRQ_PATH,
-            write_index=False,
-            engine='pyarrow',
-            compression='snappy',
-            schema=schema  # Use the explicit schema
-        )
+    PREPROC_PRQ_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(
+        PREPROC_PRQ_PATH,
+        engine="pyarrow",
+        compression="snappy",
+        schema=schema,
+        index=False,
+    )
+
+    print(f"Wrote preprocessed dataset to {PREPROC_PRQ_PATH} (rows={len(df)})")
 
 
 if __name__ == "__main__":

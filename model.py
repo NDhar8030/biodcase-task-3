@@ -100,7 +100,7 @@ def create_model(input_shape, n_filters_1=32, n_filters_2=64, dropout=0.02) -> M
     )
     return model
 
-def create_model(input_shape,dropout=0.05) -> Model:
+def create_model(input_shape,dropout=0.0) -> Model:
     inputs = layers.Input(shape=input_shape)
     x = inputs
 
@@ -120,7 +120,7 @@ def create_model(input_shape,dropout=0.05) -> Model:
     x = layers.Dense(16, activation='relu')(x)
 
     outputs = layers.Dense(2, activation='softmax')(x)
-    model = Model(inputs, outputs, name="convgru_2")
+    model = Model(inputs, outputs, name="convgru_3")
     model.compile(
         optimizer='adam',
         loss='binary_crossentropy',

@@ -2,17 +2,14 @@ import json
 from functools import partial
 import faulthandler
 
-import dask
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 import plotly.graph_objects as go
 import pyarrow as pa
-from numpy.lib.stride_tricks import sliding_window_view
 from plotly.subplots import make_subplots
-from tqdm.dask import TqdmCallback
+from tqdm import tqdm
 
-from biodcase_tiny.feature_extraction.feature_extraction import process_window, make_constants
 from config import load_config, Config
 from paths import PREPROC_PRQ_PATH, FEATURES_PRQ_PATH, FEATURES_SAMPLE_PLOT_PATH, FEATURES_SHAPE_JSON_PATH
 
@@ -62,91 +59,112 @@ def get_features_shape(clip_len_ms, clip_sample_rate, window_len_samples, window
     return [(clip_len_samples - window_len_samples) // window_stride_samples + 1, mel_n_channels]
 
 
-def apply_windowed(data, window_len, window_stride, fn):
-    v = sliding_window_view(data, window_len)[::window_stride]
-    outs = []
-    for row in v:
-        outs.append(fn(row))
-    return np.array(outs)
+def amplitude_to_db(x: tf.Tensor, top_db: float = 80.0) -> tf.Tensor:
+    """Convert an amplitude spectrogram to dB-scaled spectrogram."""
+    log_spec = 10.0 * tf.math.log(tf.maximum(x, 1e-20)) / tf.math.log(10.0)
+    max_val = tf.reduce_max(log_spec)
+    return tf.maximum(log_spec, max_val - top_db)
+
+
+def wav_to_log_mel_spectrogram(
+    wav: np.ndarray, params
+) -> np.ndarray:
+    """Compute log-mel-spectrogram using TensorFlow ops and return as numpy array."""
+    # Convert to float32 in [-1, 1]
+    wav_f32 = tf.cast(wav, tf.float32) / 32767.0
+
+    # Pad if shorter than desired
+    desired_len = params.pad_to_samples
+    wav_len = tf.shape(wav_f32)[0]
+
+    def _pad():
+        return tf.concat([wav_f32, tf.zeros([desired_len - wav_len])], axis=0)
+
+    def _crop():
+        return wav_f32[: desired_len]
+
+    wav_f32 = tf.cond(
+        wav_len < desired_len,
+        _pad,
+        _crop,
+    )
+
+    # STFT -> magnitude spectrogram
+    stfts = tf.signal.stft(
+        wav_f32,
+        frame_length=params.frame_length,
+        frame_step=params.frame_step,
+        fft_length=params.frame_length,
+        window_fn=tf.signal.hann_window,
+    )
+    spectrogram = tf.abs(stfts)
+
+    # Mel scale
+    mel_mat = tf.signal.linear_to_mel_weight_matrix(
+        params.mel_bins,
+        params.frame_length // 2 + 1,
+        params.sample_rate,
+        lower_edge_hertz=params.fmin,
+        upper_edge_hertz=params.fmax,
+    )
+    mel_spec = tf.matmul(spectrogram, mel_mat)
+
+    # dB scaling
+    mel_db = amplitude_to_db(mel_spec, top_db=80.0)
+
+    return mel_db.numpy().astype(np.float32)
 
 
 def run_feature_extraction(config: Config):
-    faulthandler.enable()
-    dask.config.set({"dataframe.convert-string": False})
-    data = dd.read_parquet(PREPROC_PRQ_PATH)
-    fe_config = config.feature_extraction
-    dp_config = config.data_preprocessing
-    fc = make_constants(
-        fe_config.window_len,
-        dp_config.sample_rate,
-        fe_config.window_scaling_bits,
-        fe_config.mel_n_channels,
-        fe_config.mel_low_hz,
-        fe_config.mel_high_hz,
-        fe_config.mel_post_scaling_bits
+    fe_params = config.feature_extraction
+
+    # Load the pre-processed dataset
+    df = pd.read_parquet(PREPROC_PRQ_PATH)
+
+    # Helper to convert raw bytes to int16 numpy array
+    def bytes_to_array(b: bytes) -> np.ndarray:
+        return np.frombuffer(b, dtype=np.int16)
+
+    # Prepare containers
+    feature_vectors: list[np.ndarray] = []
+
+    print("Extracting log-mel spectrograms…")
+    for raw in tqdm(df["data"], total=len(df)):
+        wav_int16 = bytes_to_array(raw)
+        mel_db = wav_to_log_mel_spectrogram(wav_int16, fe_params)
+        feature_vectors.append(mel_db.flatten())
+
+    # Determine feature shape from first element
+    feature_shape = feature_vectors[0].reshape(-1, fe_params.mel_bins).shape
+
+    df["features"] = feature_vectors
+
+    # Plot a sample of 10 rows for visual inspection (before dropping raw audio)
+    sample_df = df.head(10).copy()
+    sample_df["features"] = sample_df["features"].apply(lambda x: x.reshape(feature_shape))
+    sample_df["data"] = sample_df["data"].apply(bytes_to_array)
+
+    fig = plot_features_sample(sample_df, feature_shape)
+
+    # Drop raw audio bytes now that we're done plotting
+    df = df.drop(columns=["data"])  # Drop raw audio bytes
+
+    FEATURES_PRQ_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(
+        FEATURES_PRQ_PATH,
+        engine="pyarrow",
+        compression="snappy",
+        schema={"features": pa.list_(pa.float32())},
+        index=False,
     )
 
-    # this partial stuff is just a way to set all config parameters, so we have a function that only takes data as input
-    do_windows_fn = partial(
-        apply_windowed,
-        fn=partial(
-            process_window,
-            hanning=fc.hanning_window,
-            mel_constants=fc.mel_constants,
-            fft_twiddle=fc.fft_twiddle,
-            window_scaling_bits=fc.window_scaling_bits,
-            mel_post_scaling_bits=fc.mel_post_scaling_bits
-        ),
-        window_len=fe_config.window_len,
-        window_stride=fe_config.window_stride,
-    )
+    FEATURES_SAMPLE_PLOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(FEATURES_SAMPLE_PLOT_PATH)
 
-    # Helper to convert stored bytes to numpy array
-    def bytes_to_array(b):
-        """Convert raw bytes (or other accepted formats) back to int16 numpy array."""
-        if isinstance(b, (bytes, bytearray)):
-            return np.frombuffer(b, dtype=np.int16)
-        if isinstance(b, np.ndarray):
-            return b.astype(np.int16)
-        # Fallback for legacy string representation of bytes
-        if isinstance(b, str):
-            try:
-                return np.frombuffer(eval(b), dtype=np.int16)
-            except Exception:
-                # Last-ditch effort: encode as latin-1 and interpret
-                return np.frombuffer(b.encode("latin1"), dtype=np.int16)
-        raise TypeError(f"Unsupported type for audio data: {type(b)}")
-
-    features_example = do_windows_fn(bytes_to_array(data["data"].head(1)[0]))
-    features_shape = features_example.shape
-    with TqdmCallback(desc="Extracting features from preprocessed data"):
-        data = data.map_partitions(
-            lambda df: df.assign(features=df["data"].apply(
-                lambda clip: do_windows_fn(bytes_to_array(clip)).flatten(),
-            )),
-            meta=pd.DataFrame(
-                dict(
-                    **{c: data._meta[c] for c in data._meta},
-                    features=pd.Series([], dtype=object),
-                )
-            )
-        )
-        sample = data.head(10)
-        # Ensure sample audio data is converted from bytes to numpy arrays for plotting
-        if not sample.empty:
-            sample["data"] = sample["data"].apply(bytes_to_array)
-        features_sample_fig = plot_features_sample(sample, features_shape)
-        data: dd.DataFrame = data.drop("data", axis=1)  # remove original audio
-        data.to_parquet(
-            FEATURES_PRQ_PATH,
-            schema={
-                'features': pa.list_(pa.float32())  # make sure array is serialized correctly
-            },
-            write_index=False,
-        )
-    features_sample_fig.write_image(FEATURES_SAMPLE_PLOT_PATH)
     with FEATURES_SHAPE_JSON_PATH.open("w") as f:
-        json.dump(features_shape, f)  # we save the feature shape as rows are flattened, so we can recover later
+        json.dump(feature_shape, f)
+
+    print(f"Saved features to {FEATURES_PRQ_PATH} and plot to {FEATURES_SAMPLE_PLOT_PATH}")
 
 
 if __name__ == "__main__":
