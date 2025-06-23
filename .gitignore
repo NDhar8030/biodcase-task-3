@@ -7,6 +7,10 @@
 !data/05_reporting/.gitkeep
 !data/06_generated_code/.gitkeep
 
+test_quantizable_gru.py
+gru_model.py
+integer_quant_gru.py
+
 .venv
 
 __pycache__

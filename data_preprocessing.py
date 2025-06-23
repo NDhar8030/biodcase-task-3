@@ -19,6 +19,7 @@ _PREPROC_DASK_BATCH_SIZE = 1000
 
 SPLIT_FOLDER_TO_SPLIT = {"Training_Set": "train", "Validation_Set": "validation", "Test_Set": "test"}
 
+'''
 BACKGROUND_NOISE_DIR = "data/01_raw/clips/Training_Set/Negatives/"
 augmenter = audiomentations.Compose([
     audiomentations.AddGaussianSNR(min_snr_db=4.0, max_snr_db=16.0, p=0.3),
@@ -29,6 +30,8 @@ augmenter = audiomentations.Compose([
         p=0.3
     )
 ])
+'''
+ 
 
 def extract_loudest_slice(audio_array, sample_rate, audio_slice_duration_ms):
     """Find the max of the audio, then return a slice of duration audio_slice_duration_ms centred on the max.
@@ -67,7 +70,7 @@ def run_preprocessing(config: Config):
             slice = extract_loudest_slice(audio_array, sample_rate, config.data_preprocessing.audio_slice_duration_ms)
             
             # Apply augmentation (this returns float32)
-            slice = augmenter(samples=slice, sample_rate=sample_rate)
+            #slice = augmenter(samples=slice, sample_rate=sample_rate)
             
             # Convert to int16 after all processing is done
             slice = (slice * np.iinfo(np.int16).max).astype(np.int16)
@@ -81,7 +84,7 @@ def run_preprocessing(config: Config):
             })
             
             if i < 1:
-                print("Successfully augmented slice")
+                #print("Successfully augmented slice")
                 print(f"Data type: {slice.dtype}, Shape: {slice.shape}")
         
         return pd.DataFrame(slice_data)

@@ -104,6 +104,7 @@ def process_window(w, hanning, mel_constants: FilterBankConstants, fft_twiddle, 
     )
     mel_sqrt: NDArray[np.uint64] = vec_sqrt64(mel_scaled)
     shift_scale_down(mel_sqrt, scaled_bits)
+    # Convert √power Mel values -> log-Mel domain (fixed-point log)
     mel_logged: NDArray[np.uint32] = vec_log32(mel_sqrt, 1 << mel_post_scaling_bits, 0)
     mel_logged[mel_logged == 65535] = 0
     # TODO: figure out scaling factors
