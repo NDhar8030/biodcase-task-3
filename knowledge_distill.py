@@ -10,6 +10,16 @@ This module provides a complete pipeline for model compression using:
 Integrates seamlessly with existing BioDCASE training infrastructure.
 """
 
+# Configure TFMOT environment before any TensorFlow imports
+try:
+    from setup_tfmot_env import setup_tfmot_environment
+    setup_tfmot_environment()
+except ImportError:
+    # Fallback if setup script not available
+    import os
+    os.environ['TF_USE_LEGACY_KERAS'] = '1'
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import json
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
