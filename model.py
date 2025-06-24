@@ -1,13 +1,133 @@
 from keras import Model, layers, regularizers
-from keras.src.applications.mobilenet import _conv_block, _depthwise_conv_block
 from keras.src.callbacks import History, EarlyStopping, TensorBoard, ModelCheckpoint, ReduceLROnPlateau
 from keras.src.metrics import AUC, Precision, Recall, F1Score
 import tensorflow as tf
+
+from tensorflow_model_optimization.python.core.quantization.keras import quantize
+quantize_annotate_layer = quantize.quantize_annotate_layer
+import tensorflow_model_optimization as tfmot
+from tensorflow_model_optimization.python.core.quantization.keras.quantize_config import QuantizeConfig
 
 from paths import TENSORBOARD_LOGS_PATH
 from config import Config
 
 TRAIN_CHECKPOINT_PATH = "data//04_models"
+
+class NoOpQuantizeConfig(QuantizeConfig):
+    """Skip quantising this layer (pass-through)."""
+    def get_weights_and_quantizers(self, layer):        # nothing to quantise
+        return []
+    def get_activations_and_quantizers(self, layer):    # nothing to quantise
+        return []
+    def set_quantize_weights(self, layer, quantize_weights):   # no-op
+        pass
+    def set_quantize_activations(self, layer, quantize_activations):  # no-op
+        pass
+    def get_output_quantizers(self, layer):             # leave outputs untouched
+        return []
+    def get_config(self):                               # for serialization
+        return {}
+
+# -----------------------------------------------------------------------------
+# MobileNet building-blocks re-implemented with public Keras layers
+# -----------------------------------------------------------------------------
+# These mirror `keras.applications.mobilenet._conv_block` and
+# `keras.applications.mobilenet._depthwise_conv_block` but avoid the private
+# imports that break serialization / quantization.
+#
+#   • Conv   → BatchNorm → ReLU6
+#   • DepthwiseConv2D → BatchNorm → ReLU6 → 1×1 Conv → BatchNorm → ReLU6
+# -----------------------------------------------------------------------------
+
+
+def _conv_block(
+    inputs,
+    filters: int,
+    *,
+    alpha: float = 1.0,
+    kernel: tuple[int, int] = (3, 3),
+    strides: tuple[int, int] = (1, 1),
+    block_id: str | int | None = None,
+):
+    """A single MobileNet convolutional block (Conv → BN → ReLU6)."""
+    channel_axis = -1  # TF data format (NHWC)
+    filters = int(filters * alpha)
+
+    name_prefix = f"conv_{block_id}" if block_id is not None else "conv"
+
+    x = layers.Conv2D(
+        filters,
+        kernel,
+        strides=strides,
+        padding="same",
+        use_bias=False,
+        name=f"{name_prefix}" if block_id is not None else name_prefix,
+    )(inputs)
+
+    bn = layers.BatchNormalization(
+        axis=channel_axis, momentum=0.99, epsilon=1e-3, name=f"{name_prefix}_bn"
+    )(x)
+
+    #annotated_bn = quantize_annotate_layer(bn, NoOpQuantizeConfig())
+    #x = annotated_bn(x)
+
+    x = layers.ReLU(max_value=6.0, name=f"{name_prefix}_relu")(bn)
+    return x
+
+
+def _depthwise_conv_block(
+    inputs,
+    *,
+    pointwise_conv_filters: int,
+    alpha: float = 1.0,
+    depth_multiplier: int = 1,
+    block_id: int = 1,
+    strides: tuple[int, int] = (1, 1),
+):
+    """Depthwise separable block used in MobileNet v1.
+
+    Consists of:
+      DepthwiseConv2D → BN → ReLU6 → 1×1 Conv (pointwise) → BN → ReLU6
+    """
+    channel_axis = -1
+    pw_filters = int(pointwise_conv_filters * alpha)
+
+    # Depthwise conv
+    x = layers.DepthwiseConv2D(
+        (3, 3),
+        padding="same",
+        depth_multiplier=depth_multiplier,
+        strides=strides,
+        use_bias=False,
+        name=f"conv_dw_{block_id}",
+    )(inputs)
+
+    bn = layers.BatchNormalization(
+        axis=channel_axis, momentum=0.99, epsilon=1e-3, name=f"conv_pw_{block_id}_bn"
+    )(x)
+    #annotated_bn = quantize_annotate_layer(bn, NoOpQuantizeConfig())
+    #x = annotated_bn(x)
+
+    x = layers.ReLU(max_value=6.0, name=f"conv_dw_{block_id}_relu")(bn)
+
+    # Pointwise conv (1×1)
+    x = layers.Conv2D(
+        pw_filters,
+        (1, 1),
+        padding="same",
+        use_bias=False,
+        strides=(1, 1),
+        name=f"conv_pw_{block_id}",
+    )(x)
+
+    bn = layers.BatchNormalization(
+        axis=channel_axis, momentum=0.99, epsilon=1e-3, name=f"conv_pw_{block_id}_bn"
+    )(x)
+    #annotated_bn = quantize_annotate_layer(bn, NoOpQuantizeConfig())
+    #x = annotated_bn(x)
+
+    x = layers.ReLU(max_value=6.0, name=f"conv_pw_{block_id}_relu")(bn)
+    return x
 
 def create_model(input_shape, n_filters_1=32, n_filters_2=64, dropout=0.02) -> Model:
     inputs = layers.Input(shape=input_shape)

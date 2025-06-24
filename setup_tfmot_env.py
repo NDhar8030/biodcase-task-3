@@ -13,6 +13,9 @@ def setup_tfmot_environment():
     # Force TensorFlow to use legacy Keras (v2) instead of Keras v3
     os.environ['TF_USE_LEGACY_KERAS'] = '1'
     
+    # Additional Keras compatibility settings
+    os.environ['KERAS_BACKEND'] = 'tensorflow'
+    
     # Disable oneDNN optimizations if causing issues
     os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
     
@@ -33,13 +36,19 @@ def setup_tfmot_environment():
         import tensorflow_model_optimization as tfmot
         print(f"   - TensorFlow: {tf.__version__}")
         print(f"   - TFMOT: {tfmot.__version__}")
-        print(f"   - Keras: {tf.keras.__version__}")
         
-        # Check if we're using the correct Keras version
-        if hasattr(tf.keras, '_keras_api_names'):
+        # Check Keras version safely
+        try:
+            import tf_keras
+            print(f"   - tf-keras: {tf_keras.__version__}")
             print("   - Using TensorFlow's built-in Keras (Legacy)")
-        else:
-            print("   - Using external Keras")
+        except ImportError:
+            try:
+                keras_version = getattr(tf.keras, '__version__', 'Unknown')
+                print(f"   - Keras: {keras_version}")
+                print("   - Using standard Keras")
+            except:
+                print("   - Keras: Version detection failed")
             
     except ImportError as e:
         print(f"⚠️  Import error: {e}")

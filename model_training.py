@@ -107,13 +107,13 @@ def get_class_weight(train_ds):
 
 def predict_validation(model: Model, val_dataset: tf.data.Dataset):
     val_ds = val_dataset.cache().prefetch(tf.data.AUTOTUNE)
-    y_true = np.concat(list(val_ds.map(lambda x, y: y).as_numpy_iterator()))
+    y_true = np.concatenate(list(val_ds.map(lambda x, y: y).as_numpy_iterator()))
     y_pred = model.predict(val_ds)
     return y_true, y_pred
 
 def predict_train(model: Model, train_dataset: tf.data.Dataset):
     train_ds = train_dataset.cache().prefetch(tf.data.AUTOTUNE)
-    y_true = np.concat(list(train_ds.map(lambda x, y: y).as_numpy_iterator()))
+    y_true = np.concatenate(list(train_ds.map(lambda x, y: y).as_numpy_iterator()))
     y_pred = model.predict(train_ds)
     return y_true, y_pred
 
